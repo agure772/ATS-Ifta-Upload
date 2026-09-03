@@ -1,0 +1,16 @@
+{
+  "name": "ats-ifta-upload",
+  "version": "1.0.0",
+  "description": "ATS IFTA document upload service",
+  "main": "api.js",
+  "scripts": {
+    "start": "node api.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "multer": "^1.4.5-lts.1"
+  }
+}
