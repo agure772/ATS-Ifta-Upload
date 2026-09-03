@@ -1,186 +1,300 @@
 /**
- * IFTA upload routes — example / reference implementation
+ * ATS IFTA Upload — server entry point
  * -----------------------------------------------------------------
- * Drop into your Express app and wire up the two TODO sections below
- * with your real token store and GHL API client. This is the piece
- * that actually decides "does this upload belong to this opportunity,"
- * not just the front-end form.
+ * Built directly off the proven GHL integration in your ATS Dashboard
+ * project (same auth pattern, same DOT# field ID, same pipeline-by-name
+ * lookup, same /medias/upload endpoint).
  *
- * Design:
- *  1. GET  /api/upload-token/:token
- *       Looks up the record the token was generated for (opportunityId,
- *       contactId, dot_number, company_name, quarter). This is what
- *       populates the badge on the upload page and lets the page
- *       cross-check the DOT# the customer types in real time.
+ * ENV VARS NEEDED ON RENDER:
+ *   GHL_API_TOKEN     - your Private Integration token (pit-...)  [already set]
+ *   GHL_LOCATION_ID    - your GHL sub-account location ID          [already set]
+ *   ADMIN_SECRET       - a password you make up, protects the
+ *                         link-generation endpoint
+ *   GHL_FUEL_FIELD_ID  - the ONE piece still missing: the custom field
+ *                         ID for "Fuel Report" on the opportunity.
+ *                         Find it the same way you'd find any custom
+ *                         field ID — GET /locations/{locationId}/customFields
+ *                         and look for the fuel report field's "id".
  *
- *  2. POST /api/upload-ifta
- *       Re-validates token -> record server-side (never trust the
- *       client), THEN requires the submitted dot_number to match the
- *       record's dot_number before writing anything to GHL. This is
- *       the actual guarantee that files land on the right card.
+ * Everything else (DOT# field, mileage field, pipeline lookup) uses
+ * IDs and patterns already confirmed working in your other project.
  *
- *  If you want the page to also work with a single generic link (no
- *  per-customer token), see the fallback block in the POST handler —
- *  it looks the opportunity up by DOT# alone, but only proceeds on an
- *  unambiguous single match.
+ * PIPELINE NAMING:
+ *   Pipelines are matched by NAME, not a hardcoded ID — e.g. a token
+ *   generated with quarter: "Q2 2026" will look up the pipeline named
+ *   "Q2 2026 IFTA Filing". This matches how your ATS Dashboard project
+ *   already names its IFTA pipelines, so no manual ID lookup needed.
+ *
+ * TOKEN STORE:
+ *   In-memory (resets on restart) — same approach as your other
+ *   project's uploadTokens Map. Fine to start with; move to a real
+ *   database once you're sending real customer links regularly.
  */
 
 const express = require('express');
+const path = require('path');
+const crypto = require('crypto');
 const multer = require('multer');
-const router = express.Router();
+
+const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
+const PORT = process.env.PORT || 3000;
 
-// ---------------------------------------------------------------
-// TODO: replace with your real lookup (DB table, Redis, GHL custom
-// object, wherever you currently store "token -> opportunity" links).
-// ---------------------------------------------------------------
-async function getRecordByToken(token) {
-  // Example shape of what this should return:
-  // return {
-  //   token,
-  //   opportunityId: 'ghl_opp_id',
-  //   contactId: 'ghl_contact_id',
-  //   dot_number: '1234567',
-  //   company_name: 'Acme Trucking LLC',
-  //   quarter: 'Q3 2026',
-  // };
-  throw new Error('getRecordByToken() not implemented');
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+app.use(express.static(path.join(__dirname)));
+
+// ------------------------------------------------------------------
+// GHL API helper (same pattern as your ATS Dashboard's `ghl()` function)
+// ------------------------------------------------------------------
+const V2 = 'https://services.leadconnectorhq.com';
+const LOC_ID = process.env.GHL_LOCATION_ID;
+const API_KEY = process.env.GHL_API_TOKEN || process.env.GHL_API_KEY;
+const HDRS = {
+  Authorization: `Bearer ${API_KEY}`,
+  'Content-Type': 'application/json',
+  Version: '2021-07-28',
+};
+
+async function ghl(method, url, body = null, retries = 3) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    const res = await fetch(url, {
+      method,
+      headers: HDRS,
+      ...(body ? { body: JSON.stringify(body) } : {}),
+    });
+    const text = await res.text();
+    let data;
+    try { data = text ? JSON.parse(text) : {}; } catch { data = { raw: text }; }
+
+    if (res.status === 429 && attempt < retries) {
+      const wait = attempt * 1000;
+      console.log(`GHL 429 rate limit — retrying in ${wait}ms (attempt ${attempt}/${retries})`);
+      await new Promise((r) => setTimeout(r, wait));
+      continue;
+    }
+    if (!res.ok) {
+      const err = new Error(data.message || data.msg || `HTTP ${res.status}`);
+      err.status = res.status;
+      err.data = data;
+      throw err;
+    }
+    return data;
+  }
 }
 
-// TODO: replace with a GHL API search by custom field "DOT Number"
-// (used only for the generic-link fallback path).
-async function findOpportunityByDot(dotNumber) {
-  // Should return an array of matches: [{ opportunityId, contactId, company_name, dot_number }, ...]
-  // Use GHL's opportunity/contact search filtered on your DOT custom field.
-  throw new Error('findOpportunityByDot() not implemented');
+// Confirmed working custom field IDs (from your ATS Dashboard project)
+const CF_IDS = {
+  dot_number: 'E5MJr7vstJWSi59CxAbK', // DOT# — on the Contact
+  mileage_report: '4a8oST56fVNDICUImVKo', // Mileage Report — on the Opportunity
+  fuel_report: process.env.GHL_FUEL_FIELD_ID || null, // TODO: fill in via Render env var
+};
+
+// ------------------------------------------------------------------
+// Pipeline lookup by name (loaded once, cached) — same approach as
+// your ATS Dashboard's loadPipelines()/pipelineCache.
+// ------------------------------------------------------------------
+let pipelineCache = {};
+
+async function loadPipelines() {
+  try {
+    const d = await ghl('GET', `${V2}/opportunities/pipelines?locationId=${LOC_ID}`);
+    (d.pipelines || []).forEach((p) => {
+      const stages = {};
+      (p.stages || []).forEach((s) => { stages[s.name] = s.id; });
+      pipelineCache[p.name] = { id: p.id, stages };
+    });
+    console.log(`Loaded ${Object.keys(pipelineCache).length} pipelines`);
+  } catch (e) {
+    console.log('Pipeline load failed:', e.message);
+  }
 }
 
-// TODO: replace with your actual GHL API calls to attach the files
-// (upload to GHL media, then set custom field values / add attachments)
-// and to log an audit note on the opportunity.
-async function attachFilesToOpportunity({ opportunityId, mileageFile, fuelFile, dotNumber, quarter }) {
-  const target = QUARTER_PIPELINES[quarter];
-  if (!target) throw new Error(`Unknown quarter "${quarter}" — no pipeline mapping configured`);
-
-  // 1. Upload mileageFile.buffer / fuelFile.buffer to GHL media library
-  //    (or your own storage) to get public/API-accessible URLs.
-  // 2. PATCH the opportunity's custom fields (e.g. "Mileage Report URL",
-  //    "Fuel Report URL") with those URLs.
-  // 3. Move (or create, if you generate a fresh opportunity per quarter)
-  //    the opportunity into target.pipelineId / target.stageId so it
-  //    lands in the correct quarter's pipeline, e.g.:
-  //    PUT /opportunities/{opportunityId}  { pipelineId: target.pipelineId, pipelineStageId: target.stageId }
-  // 4. Add a Note to the opportunity, e.g.:
-  //    `IFTA ${quarter} docs uploaded ${new Date().toISOString()} — DOT# ${dotNumber} — ` +
-  //    `mileage: ${mileageFile.originalname}, fuel: ${fuelFile.originalname}`
-  //    This note is your audit trail of exactly what was received, for which quarter, and matched to whom.
+// Given a stored "Q2 2026" style quarter string, find the matching
+// pipeline (named e.g. "Q2 2026 IFTA Filing") and its "In Progress" stage.
+function getIftaPipeline(quarterLabel) {
+  const pipelineName = `${quarterLabel} IFTA Filing`;
+  const pipeline = pipelineCache[pipelineName];
+  if (!pipeline) return null;
+  const stageId =
+    pipeline.stages['In Progress'] ||
+    pipeline.stages['Open'] ||
+    Object.values(pipeline.stages)[0];
+  return { pipelineId: pipeline.id, stageId, pipelineName };
 }
 
 function normalizeDot(v) {
   return (v || '').toString().replace(/\D/g, '');
 }
 
-// ---------------------------------------------------------------
-// TODO: fill in your real GHL pipeline + stage IDs for each quarter.
-// These are what an uploaded quarter gets routed into.
-// ---------------------------------------------------------------
-const QUARTER_PIPELINES = {
-  Q1: { pipelineId: 'PIPELINE_ID_Q1', stageId: 'STAGE_ID_Q1_DOCS_RECEIVED' },
-  Q2: { pipelineId: 'PIPELINE_ID_Q2', stageId: 'STAGE_ID_Q2_DOCS_RECEIVED' },
-  Q3: { pipelineId: 'PIPELINE_ID_Q3', stageId: 'STAGE_ID_Q3_DOCS_RECEIVED' },
-  Q4: { pipelineId: 'PIPELINE_ID_Q4', stageId: 'STAGE_ID_Q4_DOCS_RECEIVED' },
-};
+// ------------------------------------------------------------------
+// Find a Contact by DOT# — used only by the admin link-generation
+// helper below, to save you from copy-pasting contactId/opportunityId
+// manually every time.
+// ------------------------------------------------------------------
+async function findContactByDot(dotNumber) {
+  const r = await ghl(
+    'GET',
+    `${V2}/contacts/?locationId=${LOC_ID}&query=${encodeURIComponent(dotNumber)}&limit=5`
+  );
+  const contacts = r?.contacts || [];
+  return contacts.find((c) => {
+    const cf = c.customFields?.find((f) => f.id === CF_IDS.dot_number);
+    return normalizeDot(cf?.fieldValue ?? cf?.value) === normalizeDot(dotNumber);
+  }) || null;
+}
+
+async function findOpportunitiesForContact(contactId) {
+  const data = await ghl('GET', `${V2}/contacts/${contactId}/opportunities`);
+  return data?.opportunities || [];
+}
 
 // ------------------------------------------------------------------
-// GET /api/upload-token/:token
+// Token store (in-memory — see header comment)
 // ------------------------------------------------------------------
-router.get('/api/upload-token/:token', async (req, res) => {
+const uploadTokens = new Map(); // token -> { dot_number, company_name, contactId, opportunityId, quarter, created }
+
+// ------------------------------------------------------------------
+// Admin: generate a customer upload link by DOT# alone.
+// This looks up the contact + the matching quarter's opportunity for
+// you, so you don't need to hunt down IDs by hand each time.
+// ------------------------------------------------------------------
+app.post('/api/admin/generate-link', async (req, res) => {
+  if (req.headers['x-admin-secret'] !== process.env.ADMIN_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  const { dot_number, quarter } = req.body; // quarter e.g. "Q2 2026"
+  if (!dot_number || !quarter) {
+    return res.status(400).json({ error: 'dot_number and quarter (e.g. "Q2 2026") are required' });
+  }
+
   try {
-    const record = await getRecordByToken(req.params.token);
-    if (!record) return res.status(404).json({ error: 'Invalid or expired link' });
+    const contact = await findContactByDot(dot_number);
+    if (!contact) return res.status(404).json({ error: 'No contact found for that DOT number' });
 
-    res.json({
-      dot_number: record.dot_number,
-      company_name: record.company_name,
-      contact_name: record.contact_name,
-      quarter: record.quarter,
+    const opps = await findOpportunitiesForContact(contact.id);
+    const target = getIftaPipeline(quarter);
+    if (!target) return res.status(400).json({ error: `No pipeline found named "${quarter} IFTA Filing"` });
+
+    const opp = opps.find((o) => o.pipelineId === target.pipelineId);
+    if (!opp) return res.status(404).json({ error: `Contact has no opportunity in the "${quarter} IFTA Filing" pipeline` });
+
+    const token = crypto.randomBytes(16).toString('hex');
+    uploadTokens.set(token, {
+      dot_number: normalizeDot(dot_number),
+      company_name: contact.companyName || `${contact.firstName || ''} ${contact.lastName || ''}`.trim(),
+      contactId: contact.id,
+      opportunityId: opp.id,
+      quarter,
+      created: Date.now(),
     });
+
+    const baseUrl = `${req.protocol}://${req.get('host')}`;
+    res.json({ token, url: `${baseUrl}/upload.html?t=${token}` });
   } catch (err) {
-    res.status(404).json({ error: 'Invalid or expired link' });
+    console.error('generate-link error:', err.message, err.data || '');
+    res.status(500).json({ error: err.message });
   }
 });
 
 // ------------------------------------------------------------------
+// GET /api/upload-token/:token
+// ------------------------------------------------------------------
+app.get('/api/upload-token/:token', (req, res) => {
+  const info = uploadTokens.get(req.params.token);
+  if (!info) return res.status(404).json({ error: 'Invalid or expired link' });
+  if (Date.now() - info.created > 7 * 24 * 60 * 60 * 1000) {
+    uploadTokens.delete(req.params.token);
+    return res.status(410).json({ error: 'This link has expired. Please request a new one.' });
+  }
+  res.json({
+    dot_number: info.dot_number,
+    company_name: info.company_name,
+    quarter: info.quarter,
+  });
+});
+
+// ------------------------------------------------------------------
+// Uploads a file buffer to GHL's media library (confirmed endpoint:
+// /medias/upload, from your ATS Dashboard project).
+// ------------------------------------------------------------------
+async function uploadFileToGHL(file) {
+  const form = new FormData();
+  const blob = new Blob([file.buffer], { type: file.mimetype });
+  form.append('file', blob, file.originalname);
+  form.append('locationId', LOC_ID);
+
+  const res = await fetch(`${V2}/medias/upload`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${API_KEY}` }, // no Content-Type — FormData sets its own boundary
+    body: form,
+  });
+  const data = await res.json();
+  const url = data?.url || data?.fileUrl || data?.mediaUrl;
+  if (!url) throw new Error(`GHL media upload did not return a file URL: ${JSON.stringify(data).slice(0, 200)}`);
+  return url;
+}
+
+// ------------------------------------------------------------------
 // POST /api/upload-ifta
 // ------------------------------------------------------------------
-router.post(
+app.post(
   '/api/upload-ifta',
   upload.fields([{ name: 'mileage', maxCount: 1 }, { name: 'fuel', maxCount: 1 }]),
   async (req, res) => {
-    const { token, quarter } = req.body;
+    const { token } = req.body;
     const submittedDot = normalizeDot(req.body.dot_number);
     const mileageFile = req.files?.mileage?.[0];
     const fuelFile = req.files?.fuel?.[0];
 
     if (!token) return res.status(400).json({ error: 'Missing upload token' });
     if (!submittedDot) return res.status(400).json({ error: 'DOT number is required' });
-    if (!quarter || !QUARTER_PIPELINES[quarter]) return res.status(400).json({ error: 'A valid filing quarter (Q1–Q4) is required' });
     if (!mileageFile || !fuelFile) return res.status(400).json({ error: 'Both files are required' });
 
-    let record;
-    try {
-      record = await getRecordByToken(token);
-    } catch {
-      record = null;
-    }
+    const info = uploadTokens.get(token);
+    if (!info) return res.status(404).json({ error: 'Invalid or expired link. Please contact your ATS team.' });
 
-    if (!record) {
-      // -----------------------------------------------------------
-      // Fallback for a generic (non-unique-per-customer) link: trust
-      // the DOT# alone, but only if it resolves to exactly one
-      // opportunity. Comment this whole block out if every link you
-      // send is already unique per customer.
-      // -----------------------------------------------------------
-      const matches = await findOpportunityByDot(submittedDot);
-      if (!matches || matches.length === 0) {
-        return res.status(404).json({ error: 'No account found for that DOT number. Please contact your ATS team.' });
-      }
-      if (matches.length > 1) {
-        return res.status(409).json({ error: 'Multiple accounts matched that DOT number. Please contact your ATS team.' });
-      }
-      record = matches[0];
-    } else {
-      // Token resolved to a specific opportunity — the DOT# they typed
-      // MUST match it. This is what stops a forwarded/reused link from
-      // silently updating the wrong customer's card.
-      if (normalizeDot(record.dot_number) !== submittedDot) {
-        return res.status(409).json({
-          error: 'The DOT number entered does not match the account for this link. Please contact your ATS team.',
-        });
-      }
+    if (normalizeDot(info.dot_number) !== submittedDot) {
+      return res.status(409).json({
+        error: 'The DOT number entered does not match the account for this link. Please contact your ATS team.',
+      });
     }
 
     try {
-      await attachFilesToOpportunity({
-        opportunityId: record.opportunityId,
-        mileageFile,
-        fuelFile,
-        dotNumber: submittedDot,
-        quarter,
+      const [mileageUrl, fuelUrl] = await Promise.all([
+        uploadFileToGHL(mileageFile),
+        uploadFileToGHL(fuelFile),
+      ]);
+
+      // Update the opportunity: file URLs + move to In Progress
+      const target = getIftaPipeline(info.quarter);
+      const customFields = [{ id: CF_IDS.mileage_report, field_value: mileageUrl }];
+      if (CF_IDS.fuel_report) customFields.push({ id: CF_IDS.fuel_report, field_value: fuelUrl });
+
+      await ghl('PUT', `${V2}/opportunities/${info.opportunityId}`, {
+        ...(target ? { pipelineStageId: target.stageId } : {}),
+        customFields,
+      });
+
+      // Audit trail note on the contact (same pattern as your ATS Dashboard project)
+      await ghl('POST', `${V2}/contacts/${info.contactId}/notes`, {
+        body: `IFTA ${info.quarter} docs uploaded ${new Date().toISOString()} — DOT# ${submittedDot} — mileage: ${mileageFile.originalname}, fuel: ${fuelFile.originalname} (fuel url: ${fuelUrl})`,
+      });
+
+      res.json({
+        success: true,
+        company_name: info.company_name,
+        dot_number: info.dot_number,
+        quarter: info.quarter,
       });
     } catch (err) {
-      console.error('GHL update failed', err);
-      return res.status(502).json({ error: 'Could not save your files right now. Please try again shortly.' });
+      console.error('GHL update failed:', err.message, err.data || '');
+      res.status(502).json({ error: 'Could not save your files right now. Please try again shortly.' });
     }
-
-    res.json({
-      success: true,
-      company_name: record.company_name,
-      dot_number: record.dot_number,
-      quarter,
-    });
   }
 );
 
-module.exports = router;
-
+app.listen(PORT, async () => {
+  console.log(`ATS IFTA upload server listening on port ${PORT}`);
+  await loadPipelines();
+});
