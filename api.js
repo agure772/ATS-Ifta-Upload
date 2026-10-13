@@ -229,9 +229,9 @@ app.get('/api/admin/opportunity', async (req, res) => {
 // ------------------------------------------------------------------
 // Admin: generate a customer upload link by DOT# + quarter.
 // ------------------------------------------------------------------
-app.post('/api/admin/generate-link', async (req, res) => {
+app.all('/api/admin/generate-link', async (req, res) => {
   if (!requireAdmin(req, res)) return;
-  const { dot_number, quarter } = req.body; // quarter e.g. "Q2 2026"
+  const { dot_number, quarter } = { ...req.query, ...(req.body || {}) }; // quarter e.g. "Q2 2026" (works from the browser address bar too)
   if (!dot_number || !quarter) {
     return res.status(400).json({ error: 'dot_number and quarter (e.g. "Q2 2026") are required' });
   }
