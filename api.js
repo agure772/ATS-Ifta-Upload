@@ -305,7 +305,10 @@ async function uploadFileToGHL(file) {
   const form = new FormData();
   const blob = new Blob([file.buffer], { type: file.mimetype });
   form.append('file', blob, file.originalname);
+  form.append('name', file.originalname);
   form.append('locationId', LOC_ID);
+  form.append('altId', LOC_ID);
+  form.append('altType', 'location');
 
   const res = await fetch(`${V2}/medias/upload`, {
     method: 'POST',
