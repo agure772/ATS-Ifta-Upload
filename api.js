@@ -10,25 +10,22 @@
  *   GHL_LOCATION_ID    - your GHL sub-account location ID          [already set]
  *   ADMIN_SECRET       - a password you make up, protects the admin
  *                         endpoints (link generation + field lookup)
- *   GHL_FUEL_FIELD_ID  - custom field ID for "Please Upload your Fuel
- *                         Report Here" on the opportunity. Find it with
- *                         the temporary lookup route below, then remove
- *                         that route.
  *
  * PIPELINE NAMING:
  *   Pipelines are matched by NAME, e.g. quarter "Q2 2026" looks up the
  *   pipeline named "Q2 2026 IFTA Filing".
  *
- * TOKEN STORE:
- *   In-memory (resets on restart). Fine to start with; move to a real
- *   database once you send real customer links regularly.
+ * UPLOAD LINKS:
+ *   Links are signed tokens that carry the customer details themselves, so
+ *   nothing is stored and they survive restarts. They last 30 days. Optional
+ *   env var TOKEN_SECRET signs them (falls back to ADMIN_SECRET).
  *
- * NOTE ON FILE FIELDS:
- *   The Mileage/Fuel boxes on the opportunity card look like native GHL
- *   file-upload fields. Writing a media-library URL into them may not
- *   display the file. After the field IDs and dataType are confirmed,
- *   the upload step may need to switch to GHL's dedicated "upload file
- *   to custom field" endpoint. Test with one real upload first.
+ * MAKING A LINK (browser address bar):
+ *   /api/admin/generate-link?key=ADMIN_SECRET&dot_number=1234567&quarter=Q2%202026
+ *
+ * FILE FIELDS:
+ *   Files are uploaded to GHL media storage, then the file URL is written into
+ *   the opportunity's Mileage and Fuel upload fields (confirmed working).
  */
 
 const express = require('express');
@@ -162,7 +159,42 @@ async function findOpportunitiesForContact(contactId) {
 // ------------------------------------------------------------------
 // Token store (in-memory)
 // ------------------------------------------------------------------
-const uploadTokens = new Map(); // token -> { dot_number, company_name, contactId, opportunityId, quarter, created }
+// Signed, self-contained tokens: the link itself carries the customer details
+// (DOT#, contact, opportunity, quarter) plus a signature, so nothing is stored
+// on the server and links survive Render restarts and sleep. Changing
+// TOKEN_SECRET (or ADMIN_SECRET if TOKEN_SECRET is not set) invalidates all
+// existing links.
+const TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000; // links last 30 days
+function tokenSecret() {
+  return process.env.TOKEN_SECRET || process.env.ADMIN_SECRET || '';
+}
+function signToken(payload) {
+  const body = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  const sig = crypto.createHmac('sha256', tokenSecret()).update(body).digest('base64url');
+  return `${body}.${sig}`;
+}
+// Returns the payload, or null if the token is malformed, tampered with, or expired.
+function verifyToken(token) {
+  try {
+    const [body, sig] = String(token || '').split('.');
+    if (!body || !sig || !tokenSecret()) return null;
+    const expected = crypto.createHmac('sha256', tokenSecret()).update(body).digest('base64url');
+    const a = Buffer.from(sig);
+    const b = Buffer.from(expected);
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+    const info = JSON.parse(Buffer.from(body, 'base64url').toString());
+    if (!info.created || Date.now() - info.created > TOKEN_TTL_MS) return null;
+    return info;
+  } catch {
+    return null;
+  }
+}
+
+// Company names in GHL often already end with "DOT# 1234567"; strip it so the
+// page does not show the DOT# twice.
+function cleanCompanyName(name) {
+  return (name || '').replace(/\s*[-–(]?\s*DOT\s*#?\s*\d+\)?/i, '').trim();
+}
 
 function requireAdmin(req, res) {
   const secret = process.env.ADMIN_SECRET;
@@ -173,73 +205,6 @@ function requireAdmin(req, res) {
   }
   return true;
 }
-
-// ------------------------------------------------------------------
-// TEMPORARY: look up custom field IDs.
-// Browser-friendly. Examples:
-//   /api/admin/custom-fields?key=YOUR_ADMIN_SECRET&model=opportunity&q=fuel
-//   /api/admin/custom-fields?key=YOUR_ADMIN_SECRET&model=opportunity&q=mileage
-// Returns only id, name, dataType, model and fieldKey (not the whole
-// field definition). REMOVE THIS ROUTE once you have the IDs.
-// ------------------------------------------------------------------
-app.get('/api/admin/custom-fields', async (req, res) => {
-  if (!requireAdmin(req, res)) return;
-  try {
-    const model = req.query.model ? `?model=${encodeURIComponent(req.query.model)}` : '';
-    const data = await ghl('GET', `${V2}/locations/${LOC_ID}/customFields${model}`);
-    const q = (req.query.q || '').toString().toLowerCase();
-    const fields = (data.customFields || [])
-      .filter((f) => !q || `${f.name} ${f.fieldKey}`.toLowerCase().includes(q))
-      .map((f) => ({
-        id: f.id,
-        name: f.name,
-        dataType: f.dataType,
-        model: f.model,
-        fieldKey: f.fieldKey,
-      }));
-    res.json({ count: fields.length, fields });
-  } catch (err) {
-    res.status(500).json({ error: err.message, detail: err.data || null });
-  }
-});
-
-// ------------------------------------------------------------------
-// TEMPORARY: read an opportunity's raw custom field values, so we can
-// see exactly how GHL stores a file uploaded by hand in the UI.
-//   /api/admin/opportunity?key=SECRET&dot=3671576&quarter=Q2%202026
-//   /api/admin/opportunity?key=SECRET&oppId=XXXX
-// REMOVE THIS ROUTE once the upload is working.
-// ------------------------------------------------------------------
-app.get('/api/admin/opportunity', async (req, res) => {
-  if (!requireAdmin(req, res)) return;
-  try {
-    let oppId = req.query.oppId;
-    if (!oppId) {
-      const contact = await findContactByDot(req.query.dot);
-      if (!contact) return res.status(404).json({ error: 'No contact for that DOT' });
-      const target = getIftaPipeline(req.query.quarter);
-      if (!target) return res.status(400).json({ error: `No pipeline "${req.query.quarter} IFTA Filing"` });
-      const opps = await findOpportunitiesForContact(contact.id);
-      const opp = opps.find((o) => o.pipelineId === target.pipelineId);
-      if (!opp) return res.status(404).json({ error: 'No opportunity in that pipeline' });
-      oppId = opp.id;
-    }
-    const data = await ghl('GET', `${V2}/opportunities/${oppId}`);
-    const o = data.opportunity || data;
-    res.json({
-      id: o.id,
-      name: o.name,
-      pipelineId: o.pipelineId,
-      contactId: o.contactId,
-      fileFields: (o.customFields || []).filter(
-        (f) => f.id === CF_IDS.mileage_report || f.id === CF_IDS.fuel_report
-      ),
-      allCustomFields: o.customFields || [],
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message, detail: err.data || null });
-  }
-});
 
 // ------------------------------------------------------------------
 // Admin: generate a customer upload link by DOT# + quarter.
@@ -262,10 +227,10 @@ app.all('/api/admin/generate-link', async (req, res) => {
     const opp = opps.find((o) => o.pipelineId === target.pipelineId);
     if (!opp) return res.status(404).json({ error: `Contact has no opportunity in the "${quarter} IFTA Filing" pipeline` });
 
-    const token = crypto.randomBytes(16).toString('hex');
-    uploadTokens.set(token, {
+    if (!tokenSecret()) return res.status(500).json({ error: 'Set ADMIN_SECRET (or TOKEN_SECRET) on Render first' });
+    const token = signToken({
       dot_number: normalizeDot(dot_number),
-      company_name: contact.companyName || `${contact.firstName || ''} ${contact.lastName || ''}`.trim(),
+      company_name: cleanCompanyName(contact.companyName || `${contact.firstName || ''} ${contact.lastName || ''}`.trim()),
       contactId: contact.id,
       opportunityId: opp.id,
       quarter,
@@ -273,7 +238,7 @@ app.all('/api/admin/generate-link', async (req, res) => {
     });
 
     const baseUrl = `${req.protocol}://${req.get('host')}`;
-    res.json({ token, url: `${baseUrl}/upload.html?t=${token}` });
+    res.json({ token, url: `${baseUrl.replace(/^http:/, 'https:')}/upload.html?t=${token}` });
   } catch (err) {
     console.error('generate-link error:', err.message, err.data || '');
     res.status(500).json({ error: err.message });
@@ -284,12 +249,8 @@ app.all('/api/admin/generate-link', async (req, res) => {
 // GET /api/upload-token/:token
 // ------------------------------------------------------------------
 app.get('/api/upload-token/:token', (req, res) => {
-  const info = uploadTokens.get(req.params.token);
+  const info = verifyToken(req.params.token);
   if (!info) return res.status(404).json({ error: 'Invalid or expired link' });
-  if (Date.now() - info.created > 7 * 24 * 60 * 60 * 1000) {
-    uploadTokens.delete(req.params.token);
-    return res.status(410).json({ error: 'This link has expired. Please request a new one.' });
-  }
   res.json({
     dot_number: info.dot_number,
     company_name: info.company_name,
@@ -347,7 +308,7 @@ app.post(
     if (!submittedDot) return res.status(400).json({ error: 'DOT number is required' });
     if (!mileageFile || !fuelFile) return res.status(400).json({ error: 'Both files are required' });
 
-    const info = uploadTokens.get(token);
+    const info = verifyToken(token);
     if (!info) return res.status(404).json({ error: 'Invalid or expired link. Please contact your ATS team.' });
 
     if (normalizeDot(info.dot_number) !== submittedDot) {
@@ -383,8 +344,7 @@ app.post(
       });
     } catch (err) {
       console.error('GHL update failed:', err.message, err.data || '');
-      // TEMPORARY DEBUG: show the real reason on the page. Put the friendly message back once uploads work.
-      res.status(502).json({ error: `DEBUG[build 6, locId ${LOC_ID ? 'set len ' + LOC_ID.length : 'MISSING'}]: ${err.message} ${JSON.stringify(err.data || '').slice(0, 400)}` });
+      res.status(502).json({ error: 'Could not save your files right now. Please try again shortly.' });
     }
   }
 );
