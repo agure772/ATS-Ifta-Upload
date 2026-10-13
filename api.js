@@ -140,7 +140,10 @@ async function findContactByDot(dotNumber) {
 }
 
 async function findOpportunitiesForContact(contactId) {
-  const data = await ghl('GET', `${V2}/contacts/${contactId}/opportunities`);
+  const data = await ghl(
+    'GET',
+    `${V2}/opportunities/search?location_id=${LOC_ID}&contact_id=${contactId}&limit=100`
+  );
   return data?.opportunities || [];
 }
 
