@@ -302,23 +302,33 @@ app.get('/api/upload-token/:token', (req, res) => {
 // FIELDS in the header comment — this may need to change).
 // ------------------------------------------------------------------
 async function uploadFileToGHL(file) {
-  const form = new FormData();
-  const blob = new Blob([file.buffer], { type: file.mimetype });
-  form.append('file', blob, file.originalname);
-  form.append('name', file.originalname);
-  form.append('locationId', LOC_ID);
-  form.append('altId', LOC_ID);
-  form.append('altType', 'location');
+  // GHL's documented media endpoint is /medias/upload-file; /medias/upload is
+  // the older route. Try the documented one first, then fall back, and report
+  // both answers if neither returns a URL.
+  const attempts = [];
+  for (const endpoint of ['/medias/upload-file', '/medias/upload']) {
+    const form = new FormData();
+    const blob = new Blob([file.buffer], { type: file.mimetype || 'application/octet-stream' });
+    form.append('file', blob, file.originalname);
+    form.append('name', file.originalname);
+    form.append('hosted', 'false');
+    form.append('altId', String(LOC_ID));
+    form.append('altType', 'location');
+    form.append('locationId', String(LOC_ID));
 
-  const res = await fetch(`${V2}/medias/upload`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${API_KEY}`, Version: '2021-07-28' }, // no Content-Type — FormData sets its own boundary
-    body: form,
-  });
-  const data = await res.json();
-  const url = data?.url || data?.fileUrl || data?.mediaUrl;
-  if (!url) throw new Error(`GHL media upload did not return a file URL: ${JSON.stringify(data).slice(0, 200)}`);
-  return url;
+    const res = await fetch(`${V2}${endpoint}`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${API_KEY}`, Version: '2021-07-28' }, // no Content-Type — FormData sets its own boundary
+      body: form,
+    });
+    const text = await res.text();
+    let data;
+    try { data = JSON.parse(text); } catch { data = { raw: text.slice(0, 200) }; }
+    const url = data?.url || data?.fileUrl || data?.mediaUrl;
+    if (url) return url;
+    attempts.push(`${endpoint} -> ${res.status} ${JSON.stringify(data).slice(0, 160)}`);
+  }
+  throw new Error(`GHL media upload did not return a file URL. ${attempts.join(' | ')}`);
 }
 
 // ------------------------------------------------------------------
@@ -374,7 +384,7 @@ app.post(
     } catch (err) {
       console.error('GHL update failed:', err.message, err.data || '');
       // TEMPORARY DEBUG: show the real reason on the page. Put the friendly message back once uploads work.
-      res.status(502).json({ error: `DEBUG: ${err.message} ${JSON.stringify(err.data || '').slice(0, 400)}` });
+      res.status(502).json({ error: `DEBUG[build 6, locId ${LOC_ID ? 'set len ' + LOC_ID.length : 'MISSING'}]: ${err.message} ${JSON.stringify(err.data || '').slice(0, 400)}` });
     }
   }
 );
