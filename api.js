@@ -3,32 +3,32 @@
  * -----------------------------------------------------------------
  * Built directly off the proven GHL integration in your ATS Dashboard
  * project (same auth pattern, same DOT# field ID, same pipeline-by-name
- * lookup, same /medias/upload endpoint).
+ * lookup).
  *
  * ENV VARS NEEDED ON RENDER:
  *   GHL_API_TOKEN     - your Private Integration token (pit-...)  [already set]
  *   GHL_LOCATION_ID    - your GHL sub-account location ID          [already set]
- *   ADMIN_SECRET       - a password you make up, protects the
- *                         link-generation endpoint
- *   GHL_FUEL_FIELD_ID  - the ONE piece still missing: the custom field
- *                         ID for "Fuel Report" on the opportunity.
- *                         Find it the same way you'd find any custom
- *                         field ID — GET /locations/{locationId}/customFields
- *                         and look for the fuel report field's "id".
- *
- * Everything else (DOT# field, mileage field, pipeline lookup) uses
- * IDs and patterns already confirmed working in your other project.
+ *   ADMIN_SECRET       - a password you make up, protects the admin
+ *                         endpoints (link generation + field lookup)
+ *   GHL_FUEL_FIELD_ID  - custom field ID for "Please Upload your Fuel
+ *                         Report Here" on the opportunity. Find it with
+ *                         the temporary lookup route below, then remove
+ *                         that route.
  *
  * PIPELINE NAMING:
- *   Pipelines are matched by NAME, not a hardcoded ID — e.g. a token
- *   generated with quarter: "Q2 2026" will look up the pipeline named
- *   "Q2 2026 IFTA Filing". This matches how your ATS Dashboard project
- *   already names its IFTA pipelines, so no manual ID lookup needed.
+ *   Pipelines are matched by NAME, e.g. quarter "Q2 2026" looks up the
+ *   pipeline named "Q2 2026 IFTA Filing".
  *
  * TOKEN STORE:
- *   In-memory (resets on restart) — same approach as your other
- *   project's uploadTokens Map. Fine to start with; move to a real
- *   database once you're sending real customer links regularly.
+ *   In-memory (resets on restart). Fine to start with; move to a real
+ *   database once you send real customer links regularly.
+ *
+ * NOTE ON FILE FIELDS:
+ *   The Mileage/Fuel boxes on the opportunity card look like native GHL
+ *   file-upload fields. Writing a media-library URL into them may not
+ *   display the file. After the field IDs and dataType are confirmed,
+ *   the upload step may need to switch to GHL's dedicated "upload file
+ *   to custom field" endpoint. Test with one real upload first.
  */
 
 const express = require('express');
@@ -87,12 +87,11 @@ async function ghl(method, url, body = null, retries = 3) {
 const CF_IDS = {
   dot_number: 'E5MJr7vstJWSi59CxAbK', // DOT# — on the Contact
   mileage_report: '4a8oST56fVNDICUImVKo', // Mileage Report — on the Opportunity
-  fuel_report: process.env.GHL_FUEL_FIELD_ID || null, // TODO: fill in via Render env var
+  fuel_report: process.env.GHL_FUEL_FIELD_ID || null, // set via Render env var
 };
 
 // ------------------------------------------------------------------
-// Pipeline lookup by name (loaded once, cached) — same approach as
-// your ATS Dashboard's loadPipelines()/pipelineCache.
+// Pipeline lookup by name (loaded once, cached)
 // ------------------------------------------------------------------
 let pipelineCache = {};
 
@@ -110,8 +109,8 @@ async function loadPipelines() {
   }
 }
 
-// Given a stored "Q2 2026" style quarter string, find the matching
-// pipeline (named e.g. "Q2 2026 IFTA Filing") and its "In Progress" stage.
+// Given "Q2 2026", find the pipeline named "Q2 2026 IFTA Filing" and
+// its "In Progress" stage.
 function getIftaPipeline(quarterLabel) {
   const pipelineName = `${quarterLabel} IFTA Filing`;
   const pipeline = pipelineCache[pipelineName];
@@ -127,11 +126,6 @@ function normalizeDot(v) {
   return (v || '').toString().replace(/\D/g, '');
 }
 
-// ------------------------------------------------------------------
-// Find a Contact by DOT# — used only by the admin link-generation
-// helper below, to save you from copy-pasting contactId/opportunityId
-// manually every time.
-// ------------------------------------------------------------------
 async function findContactByDot(dotNumber) {
   const r = await ghl(
     'GET',
@@ -150,19 +144,54 @@ async function findOpportunitiesForContact(contactId) {
 }
 
 // ------------------------------------------------------------------
-// Token store (in-memory — see header comment)
+// Token store (in-memory)
 // ------------------------------------------------------------------
 const uploadTokens = new Map(); // token -> { dot_number, company_name, contactId, opportunityId, quarter, created }
 
+function requireAdmin(req, res) {
+  const secret = process.env.ADMIN_SECRET;
+  const supplied = req.headers['x-admin-secret'] || req.query.key;
+  if (!secret || supplied !== secret) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return false;
+  }
+  return true;
+}
+
 // ------------------------------------------------------------------
-// Admin: generate a customer upload link by DOT# alone.
-// This looks up the contact + the matching quarter's opportunity for
-// you, so you don't need to hunt down IDs by hand each time.
+// TEMPORARY: look up custom field IDs.
+// Browser-friendly. Examples:
+//   /api/admin/custom-fields?key=YOUR_ADMIN_SECRET&model=opportunity&q=fuel
+//   /api/admin/custom-fields?key=YOUR_ADMIN_SECRET&model=opportunity&q=mileage
+// Returns only id, name, dataType, model and fieldKey (not the whole
+// field definition). REMOVE THIS ROUTE once you have the IDs.
+// ------------------------------------------------------------------
+app.get('/api/admin/custom-fields', async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  try {
+    const model = req.query.model ? `?model=${encodeURIComponent(req.query.model)}` : '';
+    const data = await ghl('GET', `${V2}/locations/${LOC_ID}/customFields${model}`);
+    const q = (req.query.q || '').toString().toLowerCase();
+    const fields = (data.customFields || [])
+      .filter((f) => !q || `${f.name} ${f.fieldKey}`.toLowerCase().includes(q))
+      .map((f) => ({
+        id: f.id,
+        name: f.name,
+        dataType: f.dataType,
+        model: f.model,
+        fieldKey: f.fieldKey,
+      }));
+    res.json({ count: fields.length, fields });
+  } catch (err) {
+    res.status(500).json({ error: err.message, detail: err.data || null });
+  }
+});
+
+// ------------------------------------------------------------------
+// Admin: generate a customer upload link by DOT# + quarter.
 // ------------------------------------------------------------------
 app.post('/api/admin/generate-link', async (req, res) => {
-  if (req.headers['x-admin-secret'] !== process.env.ADMIN_SECRET) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
+  if (!requireAdmin(req, res)) return;
   const { dot_number, quarter } = req.body; // quarter e.g. "Q2 2026"
   if (!dot_number || !quarter) {
     return res.status(400).json({ error: 'dot_number and quarter (e.g. "Q2 2026") are required' });
@@ -215,8 +244,8 @@ app.get('/api/upload-token/:token', (req, res) => {
 });
 
 // ------------------------------------------------------------------
-// Uploads a file buffer to GHL's media library (confirmed endpoint:
-// /medias/upload, from your ATS Dashboard project).
+// Uploads a file buffer to GHL's media library (see NOTE ON FILE
+// FIELDS in the header comment — this may need to change).
 // ------------------------------------------------------------------
 async function uploadFileToGHL(file) {
   const form = new FormData();
@@ -266,7 +295,6 @@ app.post(
         uploadFileToGHL(fuelFile),
       ]);
 
-      // Update the opportunity: file URLs + move to In Progress
       const target = getIftaPipeline(info.quarter);
       const customFields = [{ id: CF_IDS.mileage_report, field_value: mileageUrl }];
       if (CF_IDS.fuel_report) customFields.push({ id: CF_IDS.fuel_report, field_value: fuelUrl });
@@ -276,7 +304,6 @@ app.post(
         customFields,
       });
 
-      // Audit trail note on the contact (same pattern as your ATS Dashboard project)
       await ghl('POST', `${V2}/contacts/${info.contactId}/notes`, {
         body: `IFTA ${info.quarter} docs uploaded ${new Date().toISOString()} — DOT# ${submittedDot} — mileage: ${mileageFile.originalname}, fuel: ${fuelFile.originalname} (fuel url: ${fuelUrl})`,
       });
