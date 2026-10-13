@@ -309,7 +309,7 @@ async function uploadFileToGHL(file) {
 
   const res = await fetch(`${V2}/medias/upload`, {
     method: 'POST',
-    headers: { Authorization: `Bearer ${API_KEY}` }, // no Content-Type — FormData sets its own boundary
+    headers: { Authorization: `Bearer ${API_KEY}`, Version: '2021-07-28' }, // no Content-Type — FormData sets its own boundary
     body: form,
   });
   const data = await res.json();
