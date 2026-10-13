@@ -238,12 +238,86 @@ app.all('/api/admin/generate-link', async (req, res) => {
     });
 
     const baseUrl = `${req.protocol}://${req.get('host')}`;
-    res.json({ token, url: `${baseUrl.replace(/^http:/, 'https:')}/upload.html?t=${token}` });
+    res.json({ token, company_name: cleanCompanyName(contact.companyName || `${contact.firstName || ''} ${contact.lastName || ''}`.trim()), quarter, url: `${baseUrl.replace(/^http:/, 'https:')}/upload.html?t=${token}` });
   } catch (err) {
     console.error('generate-link error:', err.message, err.data || '');
     res.status(500).json({ error: err.message });
   }
 });
+
+
+// ------------------------------------------------------------------
+// /admin — a small page for you (not customers) to make upload links:
+// type the DOT# and quarter, click, copy. The password is typed into the page
+// and sent as a header; it is never stored on the server or put in the URL.
+// ------------------------------------------------------------------
+const ADMIN_PAGE = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>ATS Upload Link Maker</title>
+<style>
+  body{margin:0;background:#0d110d;color:#d8e2d8;font-family:system-ui,Segoe UI,Arial,sans-serif;padding:24px 16px}
+  .card{max-width:560px;margin:0 auto;background:#151b15;border:1px solid #243024;border-radius:16px;padding:24px}
+  h1{margin:0 0 4px;font-size:20px;color:#6fcf6f} p.sub{margin:0 0 20px;color:#8a998a;font-size:14px}
+  label{display:block;font-size:13px;color:#9fb09f;margin:14px 0 6px}
+  input,select{width:100%;box-sizing:border-box;padding:11px 12px;border-radius:10px;border:1px solid #2c3b2c;background:#0f140f;color:#e6efe6;font-size:15px}
+  .row{display:flex;gap:10px} .row>div{flex:1}
+  button{margin-top:18px;width:100%;padding:12px;border:0;border-radius:10px;background:#5cb85c;color:#07130a;font-weight:700;font-size:15px;cursor:pointer}
+  button.alt{background:#243024;color:#cfe0cf;margin-top:8px}
+  .out{margin-top:18px;padding:14px;border-radius:12px;background:#0f140f;border:1px solid #2c3b2c;font-size:14px;display:none;word-break:break-all}
+  .err{border-color:#7a2f2f;color:#ff8a8a} .ok b{color:#6fcf6f}
+</style></head><body><div class="card">
+<h1>Upload Link Maker</h1><p class="sub">Make a customer's IFTA upload link — no copying tokens.</p>
+<label>Admin password</label><input id="pw" type="password" autocomplete="current-password">
+<label>DOT number</label><input id="dot" inputmode="numeric" placeholder="e.g. 3671576">
+<div class="row">
+  <div><label>Quarter</label><select id="q"><option>Q1</option><option>Q2</option><option>Q3</option><option>Q4</option></select></div>
+  <div><label>Year</label><input id="yr" inputmode="numeric" maxlength="4"></div>
+</div>
+<button id="go">Make link</button>
+<div id="out" class="out"></div>
+</div>
+<script>
+  var $ = function(id){return document.getElementById(id)};
+  var now = new Date();
+  $('yr').value = now.getFullYear();
+  var curQ = 'Q' + (Math.floor(now.getMonth()/3)+1);
+  // IFTA is filed after the quarter ends, so default to the previous quarter
+  var prev = {Q1:'Q4',Q2:'Q1',Q3:'Q2',Q4:'Q3'}[curQ];
+  $('q').value = prev;
+  if (curQ === 'Q1') $('yr').value = now.getFullYear()-1;
+  try { $('pw').value = sessionStorage.getItem('ats_pw') || ''; } catch(e){}
+
+  function show(html, cls){ var o=$('out'); o.className='out '+(cls||''); o.innerHTML=html; o.style.display='block'; }
+  function esc(t){ return String(t).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]}); }
+
+  $('go').onclick = function(){
+    var dot = $('dot').value.replace(/\\D/g,'');
+    var quarter = $('q').value + ' ' + $('yr').value.trim();
+    if(!dot){ show('Enter a DOT number.','err'); return; }
+    try { sessionStorage.setItem('ats_pw', $('pw').value); } catch(e){}
+    show('Working…');
+    fetch('/api/admin/generate-link', {
+      method:'POST',
+      headers:{'Content-Type':'application/json','x-admin-secret':$('pw').value},
+      body: JSON.stringify({dot_number:dot, quarter:quarter})
+    }).then(function(r){return r.json().then(function(d){return {ok:r.ok,d:d}})})
+    .then(function(x){
+      if(!x.ok){ show(esc(x.d.error||'Something went wrong'),'err'); return; }
+      var d = x.d;
+      var msg = 'Hi' + (d.company_name ? ' ' + d.company_name : '') + ', please upload your ' + d.quarter +
+        ' IFTA mileage and fuel reports using this secure link: ' + d.url;
+      show('<div class="ok"><b>' + esc(d.company_name||'Account found') + '</b> · DOT# ' + esc(dot) + ' · ' + esc(d.quarter) +
+        '</div><div style="margin:10px 0;color:#9fb09f">' + esc(d.url) + '</div>' +
+        '<button id="c1">Copy link</button><button id="c2" class="alt">Copy ready-to-send message</button>');
+      function copy(t,btn,label){ navigator.clipboard.writeText(t).then(function(){ btn.textContent='Copied ✓'; setTimeout(function(){btn.textContent=label},1500); }); }
+      $('c1').onclick=function(){copy(d.url,this,'Copy link')};
+      $('c2').onclick=function(){copy(msg,this,'Copy ready-to-send message')};
+    }).catch(function(){ show('Could not reach the server. It may be waking up — try again in 30 seconds.','err'); });
+  };
+</script></body></html>`;
+app.get('/admin', (req, res) => res.type('html').send(ADMIN_PAGE));
 
 // ------------------------------------------------------------------
 // GET /api/upload-token/:token
