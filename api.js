@@ -87,7 +87,8 @@ async function ghl(method, url, body = null, retries = 3) {
 const CF_IDS = {
   dot_number: 'E5MJr7vstJWSi59CxAbK', // DOT# — on the Contact
   mileage_report: '4a8oST56fVNDICUImVKo', // Mileage Report — on the Opportunity
-  fuel_report: process.env.GHL_FUEL_FIELD_ID || null, // set via Render env var
+  // "Please Upload your Fuel Report Here" — FILE_UPLOAD on the Opportunity
+  fuel_report: process.env.GHL_FUEL_FIELD_ID || 'pd6X6ONuhYl3sP5SdD0o',
 };
 
 // ------------------------------------------------------------------
@@ -182,6 +183,44 @@ app.get('/api/admin/custom-fields', async (req, res) => {
         fieldKey: f.fieldKey,
       }));
     res.json({ count: fields.length, fields });
+  } catch (err) {
+    res.status(500).json({ error: err.message, detail: err.data || null });
+  }
+});
+
+// ------------------------------------------------------------------
+// TEMPORARY: read an opportunity's raw custom field values, so we can
+// see exactly how GHL stores a file uploaded by hand in the UI.
+//   /api/admin/opportunity?key=SECRET&dot=3671576&quarter=Q2%202026
+//   /api/admin/opportunity?key=SECRET&oppId=XXXX
+// REMOVE THIS ROUTE once the upload is working.
+// ------------------------------------------------------------------
+app.get('/api/admin/opportunity', async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  try {
+    let oppId = req.query.oppId;
+    if (!oppId) {
+      const contact = await findContactByDot(req.query.dot);
+      if (!contact) return res.status(404).json({ error: 'No contact for that DOT' });
+      const target = getIftaPipeline(req.query.quarter);
+      if (!target) return res.status(400).json({ error: `No pipeline "${req.query.quarter} IFTA Filing"` });
+      const opps = await findOpportunitiesForContact(contact.id);
+      const opp = opps.find((o) => o.pipelineId === target.pipelineId);
+      if (!opp) return res.status(404).json({ error: 'No opportunity in that pipeline' });
+      oppId = opp.id;
+    }
+    const data = await ghl('GET', `${V2}/opportunities/${oppId}`);
+    const o = data.opportunity || data;
+    res.json({
+      id: o.id,
+      name: o.name,
+      pipelineId: o.pipelineId,
+      contactId: o.contactId,
+      fileFields: (o.customFields || []).filter(
+        (f) => f.id === CF_IDS.mileage_report || f.id === CF_IDS.fuel_report
+      ),
+      allCustomFields: o.customFields || [],
+    });
   } catch (err) {
     res.status(500).json({ error: err.message, detail: err.data || null });
   }
