@@ -10,6 +10,10 @@
  *   GHL_LOCATION_ID    - your GHL sub-account location ID          [already set]
  *   ADMIN_SECRET       - a password you make up, protects the admin
  *                         endpoints (link generation + field lookup)
+ *   GHL_FUEL_FIELD_ID  - custom field ID for "Please Upload your Fuel
+ *                         Report Here" on the opportunity. Find it with
+ *                         the temporary lookup route below, then remove
+ *                         that route.
  *
  * PIPELINE NAMING:
  *   Pipelines are matched by NAME, e.g. quarter "Q2 2026" looks up the
@@ -22,12 +26,13 @@
  * NOTE ON FILE FIELDS:
  *   The Mileage/Fuel boxes on the opportunity card look like native GHL
  *   file-upload fields. Writing a media-library URL into them may not
- *   display the file. Test with one real upload first.
+ *   display the file. After the field IDs and dataType are confirmed,
+ *   the upload step may need to switch to GHL's dedicated "upload file
+ *   to custom field" endpoint. Test with one real upload first.
  */
 
 const express = require('express');
 const path = require('path');
-const fs = require('fs');
 const crypto = require('crypto');
 const multer = require('multer');
 
@@ -41,6 +46,7 @@ app.use(express.static(path.join(__dirname)));
 
 // Serve the upload page at /upload.html (and /) no matter what the file
 // in the repo is named (upload.html, index.html, or the old inde.html typo).
+const fs = require('fs');
 function sendUploadPage(req, res) {
   for (const name of ['upload.html', 'index.html', 'inde.html']) {
     const f = path.join(__dirname, name);
@@ -89,7 +95,7 @@ async function ghl(method, url, body = null, retries = 3) {
   }
 }
 
-// Confirmed custom field IDs
+// Confirmed working custom field IDs (from your ATS Dashboard project)
 const CF_IDS = {
   dot_number: 'E5MJr7vstJWSi59CxAbK', // DOT# — on the Contact
   mileage_report: '4a8oST56fVNDICUImVKo', // Mileage Report — on the Opportunity
@@ -170,8 +176,11 @@ function requireAdmin(req, res) {
 
 // ------------------------------------------------------------------
 // TEMPORARY: look up custom field IDs.
+// Browser-friendly. Examples:
 //   /api/admin/custom-fields?key=YOUR_ADMIN_SECRET&model=opportunity&q=fuel
-// REMOVE THIS ROUTE once you have the IDs.
+//   /api/admin/custom-fields?key=YOUR_ADMIN_SECRET&model=opportunity&q=mileage
+// Returns only id, name, dataType, model and fieldKey (not the whole
+// field definition). REMOVE THIS ROUTE once you have the IDs.
 // ------------------------------------------------------------------
 app.get('/api/admin/custom-fields', async (req, res) => {
   if (!requireAdmin(req, res)) return;
@@ -234,12 +243,10 @@ app.get('/api/admin/opportunity', async (req, res) => {
 
 // ------------------------------------------------------------------
 // Admin: generate a customer upload link by DOT# + quarter.
-// Works from the browser address bar:
-//   /api/admin/generate-link?key=SECRET&dot_number=3671576&quarter=Q2%202026
 // ------------------------------------------------------------------
 app.all('/api/admin/generate-link', async (req, res) => {
   if (!requireAdmin(req, res)) return;
-  const { dot_number, quarter } = { ...req.query, ...(req.body || {}) }; // quarter e.g. "Q2 2026"
+  const { dot_number, quarter } = { ...req.query, ...(req.body || {}) }; // quarter e.g. "Q2 2026" (works from the browser address bar too)
   if (!dot_number || !quarter) {
     return res.status(400).json({ error: 'dot_number and quarter (e.g. "Q2 2026") are required' });
   }
@@ -363,7 +370,8 @@ app.post(
       });
     } catch (err) {
       console.error('GHL update failed:', err.message, err.data || '');
-      res.status(502).json({ error: 'Could not save your files right now. Please try again shortly.' });
+      // TEMPORARY DEBUG: show the real reason on the page. Put the friendly message back once uploads work.
+      res.status(502).json({ error: `DEBUG: ${err.message} ${JSON.stringify(err.data || '').slice(0, 400)}` });
     }
   }
 );
